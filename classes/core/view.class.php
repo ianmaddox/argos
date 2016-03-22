@@ -1,0 +1,766 @@
+<?php
+/**
+ * The standard view container.  Provides for view data storage and multiple template rendering.
+ * For backwards compatibility, the view maintains a flag called inUse which signals to local_prepend
+ * that a variable has been set.  If the flag is not set, local_prepend should assume that the loaded
+ * page is not MVC enabled and avoid rendering the view.
+ *
+ * The view is actually rendered in the class core_viewRenderer where the included template file cannot
+ * manipulate any of the class data.
+ *
+ * @author ianmaddox
+ *
+ * @package framework
+ * @subpackage core
+ */
+class core_view {
+	/** @var core_view $instance */
+	private static $instance;
+
+	/** @var string $pageID */
+	private static $pageID = false;
+
+	/** @var array $data Controller-driven variables for the view */
+	protected $data = array();
+
+	/** @var array $pageData Meta data required for widget rendering */
+	protected static $pageData = array();
+
+	/** @var string $instanceID The instance ID */
+	private $instanceID;
+
+	/** @var string $renderTemplate */
+	private $renderTemplate;
+
+	/** @var $viewBaseClass The base view */
+	private $viewBaseClass;
+
+	/** @var $preRender The widgets to be rendered before the view */
+	private $preRender = array();
+
+	/** @var $postRender The widgets to be rendered after the view */
+	private $postRender = array();
+
+	/** @var $inUse inUse and rendered are used to tell the local_append to render an MVC page that isn't using the router.
+	 * We should be transitioning away from its use very soon.
+	 */
+	public $inUse = false;
+
+	/** @var bool $rendered Is the view rendered */
+	public $rendered = false;
+
+	/** @var core_siteTest_test Active test */
+	public $activeTest = null;
+
+	/** @var core_siteTest_variant Active test variant */
+	public $activeTestVariant = null;
+
+	private $usedSnippets = array();
+
+	/**
+	 * @var core_page
+	 */
+	private static $masterPage = null;
+	private static $deviceType = null;
+
+	const SNIPPET_BEFORE_BODY = 'beforeBody';
+
+	const SNIPPET_START_OF_BODY = 'startOfBody';
+
+	const SNIPPET_END_OF_BODY = 'endOfBody';
+
+	const SNIPPET_AFTER_BODY = 'afterBody';
+
+	const REDIR_PERMANENT = '301';
+	const REDIR_TEMPORARY = '302';
+
+	const DEFERRED_WIDGET_DELIM_PREFIX = "\n###WIDGET###";
+	const DEFERRED_WIDGET_DELIM_START = "###START###\n";
+	const DEFERRED_WIDGET_DELIM_END = "###END###\n";
+
+	const DEVICE_DESKTOP = 'desktop';
+	const DEVICE_MOBILE = 'mobile';
+
+	const LAYOUT_DESKTOP = 'desktop';
+	const LAYOUT_RESPONSIVE = 'responsive';
+	const LAYOUT_UNDETECTED = 'undetected';
+
+	private static $deviceViewSuffixes = array(
+		self::DEVICE_MOBILE => '-mobile',
+		self::DEVICE_DESKTOP => ''
+	);
+
+	/**
+	 * Determine the default template for the requested file and instantiate the class.
+	 * Note: The default template name is the only circumstance where a view can end in anything other than .php
+	 * For example /index.html gets a view named /views/index.html
+	 */
+	private function __construct() {
+		// The renderTemplate variable is to support legacy MVC pages that live
+		// inside the document root. Once all of these pages have been eliminated,
+		// this variable and its uses can be dropped
+		$this->renderTemplate = dirname($_SERVER["SCRIPT_FILENAME"]) . '/views/' . basename($_SERVER["SCRIPT_FILENAME"]);
+		$this->renderTemplate = str_replace('.php', '.view.php', $this->renderTemplate);
+	}
+
+	/**
+	 * Allow for the setting of a single pageID that is available to all view
+	 * instances, including widgets
+	 *
+	 * @param string $pageID
+	 */
+	public static function setPageID($pageID) {
+		self::$pageID = $pageID;
+	}
+
+	/**
+	 * Gets a single pageID that is available to all view instances, including widgets
+	 *
+	 * @return string $pageID The pageID, assuming the page's controller has set one.
+	 */
+	public static function getPageID() {
+		return isset(self::$pageID) ? self::$pageID : NULL;
+	}
+
+	/**
+	 * Instantiate the class or return the existing instance.
+	 *
+	 * @var string $class an optional class which is used to isolate view variables
+	 * for a specific class if set, the value is also passed to self::setDefaultView()
+	 * @return core_view
+	 */
+	public static function getInstance($class = 'global', $singleton = true) {
+		if($singleton) {
+			if(!isset(self::$instance[$class])) {
+				$view = new self();
+				$view->instanceID = $class;
+				if($class != 'global') {
+					$view->setDefaultView($class);
+				}
+				self::$instance[$class] = $view;
+			}
+			return self::$instance[$class];
+		} else {
+			$view = new self();
+			$view->instanceID = $class;
+			if($class != 'global') {
+				$view->setDefaultView($class);
+			}
+			return $view;
+		}
+	}
+
+	/**
+	 * Get current global view options
+	 *
+	 * @return mixed[]
+	 */
+	public static function getViewOptions() {
+		return array(
+			'master' => self::$masterPage,
+			'device' => self::$deviceType
+		);
+	}
+
+	/**
+	 * Sets a page's TITLE tag to be generated by the pageHeader. You must call this sometime before
+	 * site_widget_pageHeader is rendered.
+	 *
+	 * @param string $title The value of the page's TITLE tag..
+	 */
+	public function setTitle($title) {
+		self::$pageData['title'] = $title;
+	}
+
+	/**
+	 * Sets a page's canonical location tag to be generated by the pageHeader. You must call this sometime
+	 * before site_widget_pageHeader is rendered.
+	 *
+	 * @param string $url This page's canonical url.
+	 * @param array $alsovalid Other URLs which are acceptable (don't redirect) but not canonical
+	 * @param array $qsignore Ignore these query string vars => values when looking for differences
+	 */
+	public function setCanonicalUrl($url, array $alsovalid = array(), array $qsignore = array()) {
+		self::$pageData['canonicalUrl'] = $url;
+
+		// enforce the canonicalizingificationnessity with a redirect
+
+		// figure out what we should have
+		$path = urldecode($url);
+		$qs = array();
+
+		$qpos = strpos($url, '?');
+		if($qpos !== false) {
+			$path = urldecode(substr($url, 0, $qpos));
+			parse_str(substr($url, $qpos + 1), $qs);
+		}
+
+		// figure out what we actually have
+		$havepath = $_SERVER['SCRIPT_URI'];
+		$haveqs = $_GET;
+		$compareqs = array_merge($qsignore, $haveqs);
+		// must be the same path and have at least the same query string arguments
+		if($path != $havepath && urldecode($path) != urldecode($havepath) && !in_array($havepath, $alsovalid) || array_diff($qs, $compareqs)) {
+			$newqs = array_merge($haveqs, $qs);
+			$this->sendTo($path . ($newqs ? '?' . http_build_query($newqs) : ''), self::REDIR_PERMANENT);
+		}
+	}
+
+	/**
+	 * Adds a META tag to the list to be generated by the pageHeader. You must call this sometime before
+	 * site_widget_pageHeader is rendered.
+	 *
+	 * @param string $name The name of the meta tag: 'description', 'keywords', etc.
+	 * @param string $content The content of the meta tag.
+	 */
+	public function addMetaTag($name, $content) {
+		self::$pageData['metaTags'][] = array(
+			'name' => $name,
+			'content' => $content
+		);
+	}
+
+	/**
+	 * Adds an arbitrary piece of HTML before the BODY to be generated by the pageHeader. You must call this
+	 * sometime before site_widget_pageHeader is rendered.
+	 *
+	 * @param string $snippet The snippet of HTML to insert before the <BODY> tag.
+	 */
+	public function addSnippetBeforeBody($snippet) {
+		$this->addSnippet(core_view::SNIPPET_BEFORE_BODY, $snippet);
+	}
+
+	/**
+	 * Adds an arbitrary piece of HTML after the BODY to be generated by the pageFooter. You must call this
+	 * sometime before site_widget_pageFooter is rendered.
+	 *
+	 * @param string $snippet The snippet of HTML to insert after the </BODY> tag.
+	 */
+	public function addSnippetAfterBody($snippet) {
+		$this->addSnippet(core_view::SNIPPET_AFTER_BODY, $snippet);
+	}
+
+	/**
+	 * Adds an arbitrary piece of HTML before the BODY, after the <BODY> tag, before the <BODY> tag, or
+	 * after the BODY, to be generated by the pageHeader or pageFooter, depending. You must call this
+	 * sometime before site_widget_pageHeader or site_widget_pageFooter is rendered.
+	 *
+	 * @param string $location Where in the page the snippets go: core_view::SNIPPET_BEFORE_BODY, core_view::SNIPPET_AFTER_START_OF_BODY, core_view::SNIPPET_BEFORE_END_OF_BODY, core_view::SNIPPET_AFTER_BODY
+	 * @param string $snippet The snippet of HTML to insert at this point in the output page.
+	 */
+	public function addSnippet($location, $snippet) {
+		if(!empty($this->usedSnippets[$location])) {
+			/*
+			 * If you are here because of the following error message, you most likely have a widget that is trying to
+			 * add snippets after that particular block has been pulled by the header or footer.  Plesae ensure that the
+			 * affected view calls $this->initWidget(widgetName) before the header/footer widget is executed to avoid
+			 * this problem.
+			 */
+			trigger_error("Snippet $location has already been pulled!  Please see comments above this line for more info.");
+		}
+
+		if(!in_array($location, array(self::SNIPPET_BEFORE_BODY, self::SNIPPET_START_OF_BODY, self::SNIPPET_END_OF_BODY, self::SNIPPET_AFTER_BODY))) {
+			trigger_error("Invalid location for inserting HTML snippet: '{$location}'", E_USER_WARNING);
+			return;
+		}
+
+		self::$pageData['snippets'][$location][] = $snippet;
+	}
+
+	/**
+	 * Gets the insertion snippets that go into specific parts of your view.
+	 *
+	 * @param string $location Where in the page the snippets go: core_view::SNIPPET_BEFORE_BODY, core_view::SNIPPET_AFTER_START_OF_BODY, core_view::SNIPPET_BEFORE_END_OF_BODY, core_view::SNIPPET_AFTER_BODY
+	 */
+	public function getSnippets($location) {
+		$this->usedSnippets[$location] = true;
+		if(isset(self::$pageData['snippets'][$location])) {
+			return implode("\n", self::$pageData['snippets'][$location]) . "\n";
+		}
+	}
+
+	/**
+	 * Call this from the view to get the page's TITLE tag.
+	 *
+	 * @return string $title The fully formed TITLE tag.
+	 */
+	public function getTitleTag() {
+		if(isset(self::$pageData['title'])) {
+			$title = "<title>" . self::$pageData['title'] . "</title>\n";
+		} else {
+			$title = "<title></title>\n";
+		}
+
+		return $title;
+	}
+
+	/**
+	 * Call this from the view to get the page's canonical tag.
+	 *
+	 * @return string $canonicalUrl The fully formed canonical tag.
+	 */
+	public function getCanonicalTag() {
+		if(isset(self::$pageData['canonicalUrl'])) {
+			$canonicalUrl = "<link href='" . self::getEncodedURL(self::$pageData['canonicalUrl']) . "' rel='canonical' />\n";
+		} else {
+			$canonicalUrl = "";
+		}
+		return $canonicalUrl;
+	}
+
+	/**
+	 * Return a nerfed url
+	 * @param string $tempUrl start url
+	 * @return string finish URL
+	 */
+	public function getEncodedURL($tempUrl) {
+		//urlencode entire url minus query string
+		//decode forward slashes and colon
+		//explode query string on & and then =
+		//urlencode each key value pair
+		$tempUrl = urldecode($tempUrl);
+		$hasQS = false;
+		$tempQS = '';
+		if(strpos($tempUrl, '?') !== false) {
+			$hasQS = true;
+			$tempQS = substr($tempUrl, strpos($tempUrl, '?')+1);
+			$tempUrl = substr($tempUrl, 0, strpos($tempUrl, '?'));
+			$qsArr = explode('&', $tempQS);
+			$tempQS = '';
+			foreach($qsArr AS $qsNVP) {
+				$qsNVPVals = explode('=', $qsNVP);
+				$tempQS .= (($tempQS) ? '&' : '') . urlencode($qsNVPVals[0]) . '=';
+				array_shift($qsNVPVals);
+				$tempQS .= urlencode(implode('=', $qsNVPVals));
+			}
+		}
+		$tempUrl = str_replace('%2F', '/', str_replace('%3A', ':', urlencode($tempUrl)));
+		if($hasQS) {
+			$tempUrl .= '?' . $tempQS;
+		}
+		return $tempUrl;
+	}
+
+	/**
+	 * Builds the meta tags from the information you provided in addMetaTag.
+	 *
+	 * @return string $return
+	 */
+	public function getMetaTags() {
+		if(!isset(self::$pageData['metaTags'])) {
+			return "";
+		} else {
+			$return = "";
+			foreach(self::$pageData['metaTags'] as $data) {
+				$name = htmlspecialchars($data['name'], ENT_QUOTES);
+				$content = htmlspecialchars($data['content'], ENT_QUOTES);
+				$return .= "<meta name='{$name}' content='{$content}'>\n";
+			}
+			$return = trim($return);
+		}
+
+		return $return;
+	}
+
+	/**
+	 * Set a new default view, overriding the auto-detected default.
+	 * The expected param format is identical to that of the controller class name.
+	 *
+	 * @example for $view 'dir1_dir2_viewname' corresponds to /dir1/dir2/views/viewname.php
+	 * @param string $class
+	 */
+	public function setDefaultView($class) {
+		if(substr($class, 0, 5) == 'site_') {
+			$class = substr($class, 5);
+		}
+		$this->viewBaseClass = $class;
+		$this->renderTemplate = $this->templateFileName($class);
+	}
+
+	/**
+	 * Set the master page for the request
+	 *
+	 * @param core_page $master
+	 * @param DEVICE $device
+	 */
+	public static function setViewOptions(core_page $master = null, $device = null) {
+		$master && self::$masterPage = $master;
+		$device && self::$deviceType = $device;
+	}
+
+	/**
+	 * Set an alternate view
+	 *
+	 * @param string $alt
+	 */
+	public function setAltView($alt) {
+		if(empty($this->viewBaseClass)) {
+			trigger_error("Cannot set an alternate view before calling setDefaultView()", E_USER_ERROR);
+		}
+		$this->renderTemplate = $this->templateFileName($this->viewBaseClass, $alt);
+	}
+
+	/**
+	 * Force the page to show the 404 page.
+	 *
+	 * NOTE: This must be called before you render the pageHeader. Otherwise the server won't be able
+	 * to return the 404 HTTP code.
+	 *
+	 * NOTE: This changes this page's view to one that lives in your site at /classes/page/views/404.view.php.
+	 * Remember to copy /classes/page/views/404.view.php
+	 * to your new site's repo. Otherwise this call will break the page!
+	 */
+	public function show404Page() {
+		$this->setDefaultView('site_page_404');
+		$this->inUse = true;
+		$this->render();
+		exit;
+	}
+
+	/**
+	 * Force the page to show an error page.
+	 *
+	 * NOTE: This changes this page's view to one that lives in your site at /classes/page/views/error/
+	 * Remember to copy /classes/page/views/404.view.php
+	 * Otherwise this call will break the page!
+	 *
+	 * @param string $errorName The error name
+	 * @param int $httpCode The http Response Header value to use
+	 */
+	public function showErrorPage($errorName, $httpCode = null) {
+		$this->setDefaultView('site_page_error_'.$errorName);
+		$this->inUse = true;
+		if(!is_null($httpCode)) {
+			header('HTTP/1.1 '.$httpCode);
+		}
+		$this->render();
+		exit;
+	}
+
+	/**
+	 * Redirects the user to the given page.
+	 *
+	 * @param string $url is the URL to redirect to.
+	 * @param bool $redirType toggles a 301 (permanent) vs 302 (temporary) HTTP code. 301 by default.
+	 * @param bool $exitAfter toggles whether the script terminates after this funciton is called.  True by default.
+	 */
+	public function sendTo($url, $redirType = self::REDIR_PERMANENT, $exitAfter = true) {
+		$redirType = ($redirType == self::REDIR_PERMANENT || $redirType == self::REDIR_TEMPORARY) ? $redirType : self::REDIR_PERMANENT;
+		$url = str_replace(array("\r","\n"),' ',trim($url));
+		header('Location: ' . $url, TRUE, $redirType);
+		if($exitAfter) {
+			exit;
+		}
+	}
+
+	/**
+	 * Render a template.  If no template is specified, render the default page template.
+	 * Note: Default page template rendering is done automatically by local_prepend for sites that use
+	 * core_view.  Only use this method to load specialized subtemplates.
+	 *
+	 * IMPORTANT:
+	 * If your template file is header.php, the template name (and variable you pass) is simply "header"
+	 *
+	 * @param string $template
+	 */
+	public function preRender($template = '') {
+		if($template) {
+			$template = $this->templateFileName($template);
+		} else {
+			$template = $this->renderTemplate;
+		}
+		$this->data['pageID'] = self::$pageID;
+		ob_start();
+		new core_viewRenderer($this->data, $template, $this->preRender, $this->postRender, true);
+		return ob_get_clean();
+	}
+
+	/**
+	 * Parse a blob of HTML into chunks, execute any widget placeholders found, and display the output
+	 *
+	 * @param string $html
+	 */
+	public function renderCachedHtml($html, $pageData) {
+		// Merge current pageData on top of cached pageData
+		self::$pageData = array_merge($pageData, self::$pageData);
+		$chunks = explode(self::DEFERRED_WIDGET_DELIM_PREFIX, $html);
+
+		foreach($chunks as $chunk) {
+			if(strpos($chunk, self::DEFERRED_WIDGET_DELIM_START) === 0) {
+				// This is a JSON chunk telling us to load a widget.
+				$chunk = str_replace(self::DEFERRED_WIDGET_DELIM_START, '', $chunk);
+				$widgetData = unserialize($chunk);
+				if(empty($widgetData['widgetClass'])) {
+					trigger_error("Cannot late-load widget without class name!", E_USER_ERROR);
+				}
+				// Make a reflection object
+				$reflectionObj = new ReflectionClass($widgetData['widgetClass']);
+				// Use Reflection to create a new instance, using the $args
+				$widget = $reflectionObj->newInstanceArgs($widgetData['args']);
+
+				/* @var $widget interface_widget */
+				echo $widget->render();
+			} else {
+				// This is an HTML chunk that we want to leave alone.  If it has a delimiter, remove it.
+				$chunk = str_replace(self::DEFERRED_WIDGET_DELIM_END, '', $chunk);
+				echo $chunk;
+			}
+		}
+	}
+
+	public function getPageData() {
+		return self::$pageData;
+	}
+
+	/**
+	 * Render a template.  If no template is specified, render the default page template.
+	 * Note: Default page template rendering is done automatically by local_prepend for sites that use
+	 * core_view.  Only use this method to load specialized subtemplates.
+	 *
+	 * IMPORTANT:
+	 * If your template file is header.php, the template name (and variable you pass) is simply "header"
+	 *
+	 * @param string $template
+	 */
+	public function render($template = '') {
+		if($template) {
+			$template = $this->templateFileName($template);
+		} else {
+			$template = $this->renderTemplate;
+		}
+
+		$this->data['pageID'] = self::$pageID;
+		new core_viewRenderer($this->data, $template, $this->preRender, $this->postRender, false);
+		$this->rendered = true;
+	}
+
+	/**
+	 * Set up the widgets to be rendered before the view
+	 *
+	 * @param string $widgetName
+	 */
+	public function registerPreRenderWidget($widgetName) {
+		$this->preRender[] = $widgetName;
+	}
+
+	/**
+	 * Set up the widgets to be rendered after the view
+	 *
+	 * @param string $widgetName
+	 */
+	public function registerPostRenderWidget($widgetName) {
+		$this->postRender[] = $widgetName;
+	}
+
+	/**
+	 * Turn a view name into the associated template file name.
+	 * Passing a view name with underscores will translate into a fancy path location as follows:
+	 * dir1_dir2_viewname becomes {include_path_dir}/dir1/dir2/views/viewname.php
+	 *
+	 * @param string $template
+	 * @param string $alt
+	 * @return string
+	 */
+	private function templateFileName($template, $alt = false) {
+		$template = str_replace(DIRECTORY_SEPARATOR, '', $template);
+		$chunks = explode('_', $template);
+		$fname = array_pop($chunks);
+		$path = '';
+		if(!empty($chunks)) {
+			$path = implode('/', $chunks) . '/';
+		}
+		$alt = empty($alt) ? '' : '.' . $alt;
+
+		$basefile = "{$path}views/{$fname}{$alt}.view";
+		if(self::$masterPage) {
+			$device = self::$deviceType;
+			if(!$device || !isset(self::$deviceViewSuffixes[$device]) || !self::$masterPage->hasDeviceViewSupport($device)) {
+				$device = self::DEVICE_DESKTOP;
+			}
+
+			$file = $basefile . self::$deviceViewSuffixes[$device] . '.php';
+			if(ini_get('apc.stat')) {
+				if(!file_exists_path($file)) {
+					$file = $basefile . '.php';
+				}
+			} else {
+				$cache = new core_cache(core_cache::ENGINE_APC);
+				$cachehit = $cache->get(__METHOD__ . '|' . $file);
+				if($cachehit === null) {
+					$cachehit = file_exists_path($file);
+					$cache->set(__METHOD__ . '|' . $file, $cachehit, SEC_YEAR);
+				}
+				if(!$cachehit) {
+					$file = $basefile . '.php';
+				}
+			}
+		} else {
+			$file = $basefile . '.php';
+		}
+
+		return $file;
+	}
+
+	/**
+	 * Return a CDNified URL to a css file which understands SSL context
+	 *
+	 * @param string relative path to file.  No leading slash.
+	 * @param bool add the cachex value to the end of the URL
+	 * @return string
+	 */
+	public function cssUrl($pathFile, $includeCachex = true) {
+
+		$path = cfg::get('devMode') ? 'dist' : 'minified';
+
+		return $this->makeCdnUrl('css/' . cfg::get('site') . '/' . $path . '/', $pathFile, $includeCachex);
+	}
+
+	/**
+	 * Return a CDNified URL to a js file which understands SSL context
+	 *
+	 * @param string relative path to file.  No leading slash.
+	 * @param bool add the cachex value to the end of the URL
+	 * @return string
+	 */
+	public function jsUrl($pathFile, $includeCachex = true) {
+
+		$path = cfg::get('devMode') ? 'dist' : 'minified';
+
+		return $this->makeCdnUrl('js/' . cfg::get('site') . '/' . $path . '/', $pathFile, $includeCachex);
+	}
+
+	/**
+	 * Return a CDNified URL to an absolute path which understands SSL context
+	 *
+	 * @param string relative path to file.  No leading slash.
+	 * @param bool add the cachex value to the end of the URL
+	 * @return string
+	 */
+	public function cdnUrl($pathFile, $includeCachex = true) {
+		return $this->makeCdnUrl('', $pathFile, $includeCachex);
+	}
+
+
+	/**
+	 * Do the actual building of CDN urls
+	 *
+	 * @param string prefix for relative path to file.  No leading slash.
+	 * @param string relative path to file.  No leading slash.
+	 * @param bool add the cachex value to the end of the URL
+	 * @return string
+	 */
+	private function makeCdnUrl($prefix, $pathFile, $includeCachex) {
+		if($pathFile{0} == '/') {
+			$pathFile = substr($pathFile, 1);
+		}
+		$protocol = isset($_SERVER['HTTPS']) ? 'https' : 'http';
+		$urls = cfg::get('cdn');
+		$fileURL = $urls['static'][$protocol] . $prefix . $pathFile;
+		if($includeCachex) {
+                    $fileURL .= ((strpos($pathFile, '?') !== false) ? '&' : '?') . util_cssCacheEx::get();
+		}
+		return $fileURL;
+	}
+
+	/**
+	 * Convert a single key and value into a Google Datalayer var
+	 * Used in Google Tag Manager
+	 * @see https://developers.google.com/tag-manager/devguide
+	 *
+	 * @param string $key
+	 * @param string $var
+	 * @param bool $rawJS
+	 * @return string
+	 */
+	public function makeGoogleDataLayerVar($key, $var, $rawJS = false) {
+		return $this->makeGoogleDataLayerArr(array($key => $var), $rawJS);
+	}
+
+
+	/**
+	 * Convert an associative array into a google Datalayer var
+	 * Used in Google Tag Manager
+	 * @see https://developers.google.com/tag-manager/devguide
+	 *
+	 * @param array $arr
+	 * @param bool $rawJS
+	 * @return string
+	 */
+	public function makeGoogleDataLayerArr($arr, $rawJS = false) {
+		$js = 'dataLayer.push(' . json_encode($arr) . ');';
+		if(!$rawJS) {
+			$js = '<script type="text/javascript">' . $js . '</script>';
+		}
+		return $js;
+	}
+
+
+
+	/**
+	 * Save a value to the view.  Set a safety flag to true indicating we are using the view.
+	 * The flag can be checked before rendering to ensure the view has been used.  If not, the
+	 * page that was called most likely doesn't have a view template.
+	 *
+	 * @param string $key
+	 * @param mixed $value array or scalar
+	 */
+	public function set($key, $value) {
+		$this->data[$key] = $value;
+		$this->inUse = true;
+	}
+
+	/**
+	 * Magic set wrapper function
+	 *
+	 * @param string $key
+	 * @param mixed $value
+	 */
+	public function __set($key, $value) {
+		$this->set($key, $value);
+	}
+
+	/**
+	 * Fetch a value from the view.  Only to be called from within the view.  The view is not to be
+	 * used as a global purse to carry information from one part of the code to another.
+	 *
+	 * @param string $key
+	 * @return mixed
+	 */
+	public function get($key) {
+		if(isset($this->data[$key])) {
+			return $this->data[$key];
+		}
+		return;
+	}
+
+	/**
+	 * Magic get method
+	 *
+	 * @param string $key
+	 * @param mixed $value
+	 */
+	public function __get($key) {
+		return $this->get($key);
+	}
+
+	/**
+	 * Determine whether a member value is in fact set.
+	 *
+	 * @param string $key
+	 * @return bool
+	 */
+	public function __isset($key) {
+		return isset($this->data[$key]);
+	}
+
+	/**
+	 * Determine whether a member value is in fact empty.
+	 *
+	 * @param string $key
+	 * @return bool
+	 */
+	public function __empty($key) {
+		return empty($this->data[$key]);
+	}
+
+}
